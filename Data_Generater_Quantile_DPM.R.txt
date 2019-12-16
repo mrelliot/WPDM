@@ -1,0 +1,81 @@
+library(quantreg)
+set.seed(100)
+
+#Need model type, variance
+args=commandArgs(TRUE)
+file_app1=substr(args,1,1)
+file_app2=as.numeric(substr(args,2,2))
+#file_app1='b'
+#file_app2=5
+setwd("//home//xiaxi//Quantile//data")
+
+n=200
+N.pop=20000
+TAU=c(0.1,0.25,0.5,0.75,0.9)
+####################################################################
+#Population Setting
+X.pop=rep(0,N.pop)
+setting.H=10
+strata.N=2000
+for(i in 0:(setting.H-1))
+{
+  X.pop[i*strata.N+1:strata.N]=
+    runif(n=strata.N,min=i,max=(i+1))
+}
+#T distribution
+if(file_app1=="t")
+{
+  Y.pop=rt(n=N.pop,df=5)+X.pop
+#  plot(X.pop,Y.pop,cex=0.1)
+  p=(1+ceiling(X.pop))*ceiling(X.pop)  
+}
+
+#Gamma distribution for skewed data
+if(file_app1=="s")
+{
+  #gamma
+  Y.pop=rgamma(n=N.pop,shape=X.pop^1.5/5,scale=2)
+#  plot(X.pop,Y.pop,cex=0.1)
+  p=1+Y.pop
+  #p=(1+ceiling(X.pop))*ceiling(X.pop)
+}
+
+#Bimodal model
+if(file_app1=="b")
+{
+  index=rbinom(n=N.pop,size=1,prob=0.5)
+  Y.pop=rnorm(n=N.pop,mean=X.pop,sd=4)*index+rnorm(n=N.pop,mean=-5,sd=4)*(1-index)
+  #plot(X.pop,Y.pop, cex=0.1)
+  #p=(1+ceiling(X.pop))*ceiling(X.pop)
+  p=Y.pop-min(Y.pop)+1
+}
+
+####################################################################
+trueB=rep(0,5)
+for(i in 1:5)
+{
+  trueB[i]=rq(Y.pop~X.pop,tau=TAU[i])$coefficients[2]
+}
+fileName=paste("PopPara_",file_app1,file_app2,"Quantile_DPM.txt",sep='')
+write.table(trueB,file=fileName,append=FALSE, row.names = FALSE,
+            col.names = FALSE)
+
+output=cbind(X.pop,Y.pop,p)
+fileName=paste("Pop_",file_app1,file_app2,"Quantile_DPM.txt",sep='')
+write.table(output,file=fileName,append=FALSE, row.names = FALSE,
+            col.names = FALSE)
+
+#####################################################################
+for(i in 1:200)
+{
+  fileName=paste("Sample_",file_app1,file_app2,i,"Quantile_DPM.txt",sep='')
+  index=sample(N.pop,n,prob=p)
+  index=sort(index)
+  x=X.pop[index]
+  y=Y.pop[index]
+  weight=1/p[index]
+  output=cbind(x,y,weight)
+  write.table(output,file=fileName,append=FALSE,row.names = FALSE,
+              col.names = FALSE)
+}
+

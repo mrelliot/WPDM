@@ -1,0 +1,396 @@
+setwd("E:\\Dropbox\\Research\\Application\\Normal\\Input")
+set.seed(12345)
+library(mnormt)
+library(bayesSurv)
+library(survey)
+library(quantreg)
+
+F_inv = function(p,w,u,s,br=c(-1000,1000))
+{
+  G = function(x) (F(x,w,u,s) - p)^2
+  return( optim(par=0,fn=G)$par) 
+}
+
+N.iter=3000
+burnin=1000
+n.sample=1250
+N.pop=20000
+TAU=c(0.1,0.25,0.5,0.75,0.9)
+
+#5 MI replicates
+for(fileIndex in 1:1)
+{
+  inputfilename=paste("dioxinsvc",fileIndex,".dat",sep='')
+  data=read.table(file=inputfilename,header=FALSE)
+  names(data)[names(data)=="V2"]<-"logTCDD"
+  names(data)[names(data)=="V3"]<-"age"
+  names(data)[names(data)=="V4"]<-"sex"
+  names(data)[names(data)=="V5"]<-"BMI"
+  names(data)[names(data)=="V6"]<-"Standard_BMI"
+  names(data)[names(data)=="V7"]<-"N_packyearsmoke"
+  names(data)[names(data)=="V8"]<-"breastfeeding"
+  names(data)[names(data)=="V9"]<-"incomeC"
+  names(data)[names(data)=="V10"]<-"educationC"
+  names(data)[names(data)=="V11"]<-"weight"
+  names(data)[names(data)=="V12"]<-"PSU"
+  names(data)[names(data)=="V13"]<-"Strata"
+}
+
+x.sample=cbind(data$age,data$sex)
+y.sample=data$logTCDD
+w.sample=data$weight
+w.sample=w.sample/sum(w.sample)*N.pop
+
+#trueB=rep(lm(y.pop~x.pop)$coefficients[2],5)
+###################################################################
+time=proc.time()
+p.coef=3
+#Empirical starting value
+S=rep(c(1:10),times=rep(n.sample/10,10))
+C=c(1:length(table(S)))
+theta=matrix(rep(0,(p.coef+1)*n.sample),nrow=n.sample,ncol=(p.coef+1))  
+for(i in C)
+{
+  index=(S==i)
+  theta[i,1:p.coef]=lm(y.sample[index]~x.sample[index,])$coefficients
+}
+theta[C,(p.coef+1)]=var(lm(y.sample~x.sample)$residuals)
+temp=summary(lm(y.sample~x.sample))
+SIGMA_beta_Inv=temp$cov.unscaled
+
+beta_0=lm(y.sample~x.sample)$coefficients
+#V_b0=temp$cov.unscaled*temp$sigma^2*n.sample
+#V_b0=solve(t(cbind(rep(1,n.sample),x.sample))%*%cbind(rep(1,n.sample),x.sample))/ n.sample
+V_b0=diag(rep(1,p.coef))*1000
+
+beta_00=rep(0,p.coef)
+
+#Default starting value
+gamma=rep(1/n.sample,n.sample)
+k_gamma=0.1
+psi=1 
+  
+#hyper prior
+v0=2
+SIGMA0=diag(rep(1,p.coef))
+
+alpha_tau=1
+beta_tau=0.1
+a00=0.1
+b00=0.1
+
+alpha=0.1      #alpha of DP, control rate of creating new component
+  
+#storage
+betaTemp1=matrix(rep(0,N.iter*5),ncol=5)
+betaTemp2=matrix(rep(0,N.iter*5),ncol=5)
+Z=rep(0,n.sample)
+K=matrix(rep(0,n.sample*n.sample),ncol=n.sample,nrow=n.sample)
+K_temp=K
+b=K
+b_temp=K
+Ks=K
+ksi=K
+pr=rep(0,n.sample)
+w=rep(0,n.sample) #calculate weight
+q=rep(0,n.sample) #multinomail conditional posterior for S
+V_store=rep(0,N.iter)
+k_store=rep(0,N.iter)
+psi_store=rep(0,N.iter)
+  
+  #########################################################################
+  
+for(iter in 1:N.iter)
+{
+  print(iter)
+  
+  #K kernel 
+  for(i in 1:n.sample)
+  {
+    K[i,]=exp(-1*psi*((x.sample[i,1]-x.sample[,1])^2+(x.sample[i,2]-x.sample[,2])^2))+1e-300
+  }
+  
+  #update b weight
+  b=t(gamma*K)/as.vector(gamma%*%K)
+  
+  #######################################################
+  #step 1 update S
+  #print(1)
+  for(i in 1:n.sample)
+  {
+    index=c(1:n.sample)!=i
+    k_i=length(table(S[index])) #excluding i
+    k=length(table(S)) #including i
+    #delete if S[i] is the only atom
+    if(k_i<k)
+    {
+      j=S[i]
+      if(j<k) #if not last in the list, speed up 
+      {
+        S[S>j]=S[S>j]-1
+        C[j:(k-1)]=C[(j+1):k]
+        theta[j:(k-1),]=theta[(j+1):k,]
+      }
+      S[i]=-1 #mark, just in case
+    }
+    #caluclate w
+    for(j in 1:k_i)
+    {
+      denom=alpha+sum(C[S[index]]==C[j])
+      numer=b[i,C[j]]*sum(S[index]==j)
+      w[j]=numer/denom
+    }
+    #risky,subject to floating error, but efficient
+    w[k_i+1]=max(1-sum(w[1:k_i]),0)
+    #    w[k_i+1]=0
+    #    for(j in 1:n.sample)
+    #    {
+    #      numer=alpha*b[i,j]
+    #      denom=alpha+sum(C[S[index]]==j)
+    #      w[k_i+1]=w[k_i+1]+numer/denom
+    #    }
+    #    print(w)
+    #    w_store[i,1:(k_i+1)]=w[1:(k_i+1)]
+    #calculate q
+    q[1:k_i]=w[1:k_i]*(dnorm(y.sample[i],mean=theta[1:k_i,1]+theta[1:k_i,2:p.coef]%*%x.sample[i,],sd=sqrt(theta[1:k_i,(p.coef+1)]))+1e-300)
+    #hat{V}_beta_h
+    if(S[i]==-1)
+    {
+      s2Temp=beta_tau/alpha_tau
+    }else
+    {
+      s2Temp=theta[S[i],(p.coef+1)]
+    }
+    V_hat=solve(SIGMA_beta_Inv+(c(1,x.sample[i,])%o%c(1,x.sample[i,]))/s2Temp)
+    V_hat[upper.tri(V_hat)] <- V_hat[lower.tri(V_hat)]
+    
+    #hat{beta}_h
+    beta_hat=V_hat%*%(SIGMA_beta_Inv%*%beta_0+y.sample[i]*c(1,x.sample[i,])/s2Temp)
+    
+    #shift the mean for more stability
+    temp=solve(SIGMA_beta_Inv)
+    temp[upper.tri(temp)] <- temp[lower.tri(temp)]
+    h=(dmnorm(t(beta_hat),mean=beta_0,varcov=s2Temp*temp)+1e-300)*
+      (dnorm(t(beta_hat)%*%c(1,x.sample[i,]),mean=y.sample[i],sd=sqrt(s2Temp))+1e-300)/
+      (dmnorm(t(beta_hat),mean=t(beta_hat),varcov=s2Temp*V_hat)+1e-300)
+    
+    q[k_i+1]=w[k_i+1]*h+1e-300
+    S[i]=c(1:(k_i+1))[rmultinom(1,size=1,prob=q[1:(k_i+1)])==1]
+    k=k_i
+    if (S[i]==(k_i+1))
+    {
+      k=k_i+1
+      #draw new theta for the new created strata    
+      C[S[i]]=c(1:n.sample)[rmultinom(1,size=1,prob=b[i,])==1]
+      
+      V_temp=SIGMA_beta_Inv+c(1,x.sample[i,])%*%t(c(1,x.sample[i,]))
+      b_hat=solve(V_temp)%*%(SIGMA_beta_Inv%*%beta_0+c(1,x.sample[i,])*y.sample[i])
+      theta[S[i],(p.coef+1)]=1/(rgamma(n=1,shape=alpha_tau+1/2,rate=beta_tau+
+                                0.5*(y.sample[i]^2+
+                                       t(beta_0)%*%SIGMA_beta_Inv%*%beta_0-
+                                       t(b_hat)%*%V_temp%*%b_hat))+1e-5)
+      theta[S[i],1:p.coef]=rmnorm(n=1,mean=b_hat,varcov=solve(V_temp)*theta[S[i],(p.coef+1)])
+    }
+  }
+  
+  #############################################################
+  #step 2
+  #print(2)
+  #update theta
+  #beta_hat_store=matrix(rep(0,k*2),ncol=2)
+  for(i in 1:k)
+  {
+    index=(S==i)
+    tempxx=cbind(rep(1,sum(index)),matrix(x.sample[index,],ncol=(p.coef-1)))
+    tempyx=t(tempxx)%*%y.sample[index]
+    tempxx=t(tempxx)%*%tempxx+diag(rep(1,p.coef))*(sum(index)==1)
+    tempyy=t(y.sample[index])%*%y.sample[index]
+    V_hat=SIGMA_beta_Inv+tempxx
+    beta_hat=solve(V_hat)%*%(SIGMA_beta_Inv%*%beta_0+tempyx)
+    theta[i,(p.coef+1)]=1/(rgamma(n=1,shape=alpha_tau+sum(index)/2,rate=beta_tau+
+                              0.5*(tempyy+
+                                     t(beta_0)%*%SIGMA_beta_Inv%*%beta_0-
+                                     t(beta_hat)%*%V_hat%*%beta_hat))+1e-5)
+    theta[i,1:p.coef]=rmnorm(n=1,mean=beta_hat,varcov=solve(V_hat)*theta[i,(p.coef+1)])
+  }
+  V_hat=solve(solve(V_b0)+sum(1/theta[1:k,(p.coef+1)])*SIGMA_beta_Inv)   
+  
+  temp=apply((theta[1:k,1:p.coef]/theta[1:k,(p.coef+1)])%*%SIGMA_beta_Inv,2,sum)
+  beta_hat=V_hat%*%(solve(V_b0)%*%beta_00+temp)
+  beta_0=as.vector(rmnorm(n=1,mean=beta_hat,varcov=V_hat))
+  
+  #Update SIGMA_beta
+  temp=diag(rep(0,p.coef))                                                               
+  for(i in 1:k)
+  {
+    temp=temp+(theta[i,1:p.coef]-beta_0)%*%t(theta[i,1:p.coef]-beta_0)/theta[i,(p.coef+1)]
+  }
+  temp1=rmnorm(n=k+v0,mean=0,varcov=solve(temp+v0*SIGMA0))
+  SIGMA_beta_Inv=t(temp1)%*%temp1
+  beta_tau=rgamma(n=1,shape=a00+k*alpha_tau,rate=b00+sum(1/theta[1:k,(p.coef+1)]))
+  #################################################################
+  if(TRUE)
+  {
+    #step 3
+    #print(3)
+    for(i in 1:k)
+    {
+      index=(S==i)
+      pr=apply(matrix(log(b[index,]),ncol=n.sample),2,sum)
+      pr=exp(pr-max(pr))
+      C[i]=c(1:n.sample)[rmultinom(1,size=1,prob=pr)==1]
+    }    
+  }
+  
+  ##################################################################
+  
+  if(TRUE)
+  {
+    #step 4
+    for(i in 1:n.sample)
+    {
+      Ks[i,]=K[i,]/(sum(gamma*K[i,])-gamma*K[i,]+1e-300)
+    }
+  }
+  
+  if(TRUE)
+  {    
+    for(j in 1:n.sample)
+    {
+      #    Z=rpois(n=n,lambda=gamma[j]*ksi[,j]*Ks[,j])*(C[S]==j)
+      #    store2=rexp(n)
+      #    store=gamma[j]*store2*Ks[,j]
+      store=gamma[j]*ksi[,j]*Ks[,j]
+      
+      Z=(C[S]==j)*(runif(n=n.sample,min=0,max=1)>exp(-1*store))
+      
+      #store1=gamma[j]
+      #    Z=(Z>0)
+      ksi[,j]=rgamma(n=n.sample,1+Z,1+gamma[j]*Ks[,j])+1e-300
+      
+      gamma[j]=rgamma(n=1,k_gamma+sum(Z),k_gamma*n.sample+sum(ksi[,j]*Ks[,j]))+1e-300
+    }    
+    gamma=gamma/sum(gamma)
+  }
+  
+  k_gamma_prop=rlnorm(1,log(k_gamma),.1)
+  likelihood1=sum(log(dgamma(gamma,k_gamma_prop,n.sample*k_gamma_prop)))+log(dlnorm(k_gamma_prop,-2.5,1))
+  likelihood2=sum(log(dgamma(gamma,k_gamma,n.sample*k_gamma)))+log(dlnorm(k_gamma,-2.5,1))
+  likelihood1=likelihood1+log(dlnorm(k_gamma,log(k_gamma_prop),.1))
+  likelihood2=likelihood2+log(dlnorm(k_gamma_prop,log(k_gamma),.1))
+  if(log(runif(1))<(likelihood1-likelihood2))
+  {
+    k_gamma=k_gamma_prop
+  }
+  
+  
+  psi_prop=exp(rnorm(n=1,mean=log(psi),sd=0.1))
+  for(i in 1:n.sample)
+  {
+    K_temp[i,]=exp(-1*psi_prop*((x.sample[i,1]-x.sample[,1])^2+(x.sample[i,2]-x.sample[,2])^2))+1e-300
+  }
+  for(i in 1:n.sample)
+  {
+    b_temp[i,]=gamma*K_temp[i,]/sum(gamma*K_temp[i,])
+  }
+  
+  likelihood1=log(dlnorm(psi_prop,meanlog=log(30),sdlog=0.5))
+  likelihood2=log(dlnorm(psi,meanlog=log(30),sdlog=0.5))
+  
+  for(i in 1:n.sample)
+  {
+    #temp=rep(0,n.sample)
+    #temp[C[S[i]]]=1
+    #likelihood1=likelihood1+log(dmultinom(temp,prob=b_temp[i,]))
+    #likelihood2=likelihood2+log(dmultinom(temp,prob=b[i,]))
+    likelihood1=likelihood1+
+      log(sum(b_temp[i,]*dnorm((y.sample[i]-theta[S[1:n.sample],1:p.coef]%*%c(1,x.sample[i,]))/sqrt(theta[S[1:n.sample],(p.coef+1)]),
+                               mean=0,sd=1)))
+    likelihood2=likelihood2+
+      log(sum(b[i,]*dnorm((y.sample[i]-theta[S[1:n.sample],1:p.coef]%*%c(1,x.sample[i,]))/sqrt(theta[S[1:n.sample],(p.coef+1)]),
+                          mean=0,sd=1)))
+  }
+  
+  if((log(runif(1))<(likelihood1-likelihood2))&psi_prop<exp(5))
+  {
+    psi=psi_prop
+  }
+  psi_store[iter]=psi
+  
+  w_temp=matrix(rep(0,k*n.sample),ncol=k)
+  w_temp_0=rep(0,n.sample)
+  
+#  y_est=rep(NA,n.sample)
+  y_pred=NULL
+  x_pred=NULL
+  
+  for(i in 1:n.sample)
+  {   
+    for(j in 1:k)
+    {
+      denom=alpha+sum(C[S]==C[j])
+      numer=b[i,C[j]]*sum(S==j)
+      w_temp[i,j]=numer/denom
+    }
+    #risky, but fast
+    w_temp_0[i]=max(1-sum(w_temp[i,1:k]),0)
+    w_temp1=c(w_temp[i,],w_temp_0[i])
+    temp_i=sample(1:(k+1),round(w.sample[i]),replace=TRUE,prob=w_temp1)  
+#    temp_i=sample(1:(k+1),1,replace=TRUE,prob=w_temp1)  
+    
+    var_temp=solve(SIGMA_beta_Inv)
+   
+#    if (temp_i==k+1)
+#    {        
+#      y_est[i]=rnorm(n=1,mean=x.sample[i,]*beta_0[2:p.coef]+beta_0[1],
+#                      sd=sqrt(theta[S[i],(p.coef+1)]+t(c(1,x.sample[i,]))%*%var_temp%*%c(1,x.sample[i,])))
+#    }else
+#    {
+#      y_est[i]=rnorm(n=1,mean=x.sample[i,]*theta[temp_i[j],2:p.coef]+theta[temp_i[j],1],sd=sqrt(theta[temp_i[j],(p.coef+1)]))
+#    }
+    
+    if(TRUE)
+    {
+    y_temp=rep(NA,round(w.sample[i]))    
+    for(j in 1:round(w.sample[i]))
+    {
+      if (temp_i[j]==k+1)
+      {        
+        y_temp[j]=rnorm(n=1,mean=x.sample[i,]*beta_0[2:p.coef]+beta_0[1],
+                        sd=sqrt(theta[S[i],(p.coef+1)]+t(c(1,x.sample[i,]))%*%var_temp%*%c(1,x.sample[i,])))
+      }else
+      {
+        y_temp[j]=rnorm(n=1,mean=x.sample[i,]*theta[temp_i[j],2:p.coef]+theta[temp_i[j],1],sd=sqrt(theta[temp_i[j],(p.coef+1)]))
+      }
+    }    
+    y_pred=c(y_pred,y_temp)
+    x_pred=rbind(x_pred,matrix(rep(x.sample[i,],round(w.sample[i])),ncol=(p.coef-1),byrow=TRUE))   
+    }
+  }    
+  #betaTemp[iter,1:2]=lm(y_pred~x_pred)$coefficients[2:3]
+  for(l in 1:5)
+  {
+    temp=rq(y_pred~x_pred,tau=TAU[l])
+    betaTemp1[iter,l]=temp$coefficients[2]
+    betaTemp2[iter,l]=temp$coefficients[3]    
+  }
+  k_store[iter]=k
+}
+print(time-proc.time())
+print("1st Q")
+mean(betaTemp1[251:500,2])
+sd(betaTemp1[251:500,2])
+mean(betaTemp2[251:500,2])
+sd(betaTemp2[251:500,2])
+
+print("median")
+mean(betaTemp1[251:500,3])
+sd(betaTemp1[251:500,3])
+mean(betaTemp2[251:500,3])
+sd(betaTemp2[251:500,3])
+
+print("3rd Q")
+mean(betaTemp1[251:500,4])
+sd(betaTemp1[251:500,4])
+mean(betaTemp2[251:500,4])
+sd(betaTemp2[251:500,4])
